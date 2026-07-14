@@ -3,7 +3,7 @@
 NYC 311 Speed Layer — Lambda Function
 Triggered by Kinesis Data Stream records.
 
-Implements THREE sliding windows (H1 discriminator):
+Implements THREE sliding windows :
   Window 1: Top 5 surging complaint types (last 5 minutes)
   Window 2: Rolling 1-minute average complaint rate per borough
   Window 3: Count of events per window + surge alerts
@@ -139,7 +139,6 @@ def window1_top5_complaints(complaint_counts):
 def window2_rolling_average(borough_counts, total_records):
     """
     WINDOW 2 — Rolling 1-minute average complaint rate per borough.
-    Direct match to rubric: "rolling 1-minute average"
     """
     one_min_key = get_window_key(ROLLING_MINUTES)
 
@@ -175,7 +174,6 @@ def window2_rolling_average(borough_counts, total_records):
 def window3_event_count_and_surge(complaint_counts, borough_counts, total_records):
     """
     WINDOW 3 — Count of events per window + surge detection.
-    Direct match to rubric: "count of events per window"
     """
     window_key = get_window_key(WINDOW_MINUTES)
 
