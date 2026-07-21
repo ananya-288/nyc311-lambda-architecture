@@ -1,9 +1,17 @@
 # NYC 311 Complaint Surge Detection - Lambda Architecture on AWS
 
 ## Core Question
-What are the top 5 fastest-surging complaint types in NYC right now 
-and are these surges historically anomalous for this time of day, 
-day of week, and borough?
+Which NYC 311 complaint types are trending most in the last 5 minutes — 
+and what is their historical complaint volume across the full dataset?
+
+## Speed Layer answers:
+"What are the top 5 complaint types in the last 5 minutes?"
+
+## Batch Layer answers:
+"What are the top 5 complaint types across all 7.35 million records?"
+
+## Serving Layer combines:
+"Is what's surging now historically expected or genuinely anomalous?"
 
 ## Dataset
 - Source: NYC Open Data — 311 Service Requests 2020 to Present
