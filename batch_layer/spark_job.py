@@ -71,25 +71,24 @@ def main():
 
     logger.info(f"Baseline combinations: {baseline.count():,}")
 
-    # Top 5 complaint types overall (for validation)
-    top5 = df.groupBy('complaint_type') \
-              .count() \
-              .orderBy(F.desc('count')) \
-              .limit(5)
+    # Top 5 complaint types ALL TIME per borough
+    top5_alltime = df.groupBy('borough', 'complaint_type') \
+        .count() \
+        .orderBy('borough', F.desc('count'))
 
-    logger.info("Top 5 complaint types:")
-    top5.show(truncate=False)
-
-    # Save baseline to S3
-    logger.info(f"Writing baseline to: {S3_OUTPUT}")
-    baseline.write \
-        .mode('overwrite') \
+    top5_alltime.write.mode('overwrite') \
         .option('header', 'true') \
-        .csv(S3_OUTPUT)
+        .csv('s3://nyc311-lambda-architecture/batch-results/top5-alltime/')
 
-    logger.info("Batch job complete")
-    spark.stop()
+    # Top 5 overall across entire dataset
+    top5_overall = df.groupBy('complaint_type') \
+        .count() \
+        .orderBy(F.desc('count')) \
+        .limit(5)
 
+    top5_overall.write.mode('overwrite') \
+        .option('header', 'true') \
+        .csv('s3://nyc311-lambda-architecture/batch-results/top5-overall/')
 
 if __name__ == '__main__':
     main()
