@@ -78,40 +78,53 @@ def get_speed_layer_results():
 def get_batch_baseline():
     """
     Read historical baseline from S3 batch results.
-    Returns dict: complaint_type -> historical_count
+    Matches by complaint_type + borough + current hour + current day of week.
     """
     try:
-        # List baseline files
+        # Get current hour and day of week
+        now         = datetime.now(timezone.utc)
+        current_hour = now.hour
+        current_dow  = now.isoweekday()  # 1=Monday, 7=Sunday
+
+        baseline = {}
         response = s3.list_objects_v2(
-            Bucket = BUCKET,
-            Prefix = 'batch-results/baseline/'
+            Bucket=BUCKET,
+            Prefix='batch-results/baseline/'
         )
 
         if 'Contents' not in response:
             logger.warning("No batch results found in S3")
             return {}
 
-        # Read first CSV part file
-        baseline = {}
+        # Read all part files
         for obj in response['Contents']:
-            if obj['Key'].endswith('.csv') and 'part-' in obj['Key']:
-                csv_obj  = s3.get_object(Bucket=BUCKET, Key=obj['Key'])
-                content  = csv_obj['Body'].read().decode('utf-8')
-                lines    = content.strip().split('\n')
+            if not obj['Key'].endswith('.csv'):
+                continue
 
-                for line in lines[1:]:  # skip header
-                    parts = line.split(',')
-                    if len(parts) >= 5:
-                        complaint_type   = parts[0].strip()
-                        historical_count = int(parts[4]) if parts[4].strip().isdigit() else 0
+            csv_obj = s3.get_object(Bucket=BUCKET, Key=obj['Key'])
+            content = csv_obj['Body'].read().decode('utf-8')
+            lines   = content.strip().split('\n')
 
-                        if complaint_type not in baseline:
-                            baseline[complaint_type] = 0
-                        baseline[complaint_type] += historical_count
+            for line in lines[1:]:  # skip header
+                parts = line.split(',')
+                if len(parts) < 5:
+                    continue
+                try:
+                    complaint_type   = parts[0].strip()
+                    borough          = parts[1].strip()
+                    hour             = int(parts[2].strip())
+                    day_of_week      = int(parts[3].strip())
+                    historical_count = int(parts[4].strip())
 
-                break  # just read first file for now
+                    # Only keep rows matching current hour and day
+                    if hour == current_hour and day_of_week == current_dow:
+                        key = f"{complaint_type}|{borough}"
+                        baseline[key] = historical_count
 
-        logger.info(f"Loaded baseline for {len(baseline)} complaint types")
+                except (ValueError, IndexError):
+                    continue
+
+        logger.info(f"Loaded {len(baseline)} baseline entries for hour={current_hour} day={current_dow}")
         return baseline
 
     except Exception as e:
@@ -122,8 +135,8 @@ def get_batch_baseline():
 def merge_speed_and_batch(speed_results, batch_baseline):
     """
     THE LAMBDA MERGE — combines speed and batch results.
-    Computes deviation of current counts from historical baseline.
-    This is what makes Lambda Architecture valuable.
+    Matches current complaints against historical baseline
+    for same complaint_type + borough + hour + day_of_week.
     """
     if not speed_results:
         return []
@@ -132,7 +145,18 @@ def merge_speed_and_batch(speed_results, batch_baseline):
     for complaint in speed_results.get('top5_complaints', []):
         complaint_type   = complaint['complaint_type']
         current_count    = complaint['count']
-        historical_count = batch_baseline.get(complaint_type, 0)
+
+        # Try to match with borough from speed results
+        top_borough      = speed_results.get('top_borough', 'UNKNOWN')
+        key              = f"{complaint_type}|{top_borough}"
+        historical_count = batch_baseline.get(key, 0)
+
+        # Also try without borough match
+        if historical_count == 0:
+            for k, v in batch_baseline.items():
+                if k.startswith(complaint_type):
+                    historical_count = v
+                    break
 
         # Compute deviation
         if historical_count > 0:
