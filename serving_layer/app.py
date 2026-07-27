@@ -74,18 +74,13 @@ def get_speed_layer_results():
         logger.error(f"Error reading speed layer: {e}")
         return None
 
-
 def get_batch_baseline():
     """
     Read historical baseline from S3 batch results.
-    Matches by complaint_type + borough + current hour + current day of week.
+    Keys on (complaint_type, borough, hour, day_of_week)
+    Returns avg_count_per_5min_window for accurate comparison.
     """
     try:
-        # Get current hour and day of week
-        now         = datetime.now(timezone.utc)
-        current_hour = now.hour
-        current_dow  = now.isoweekday()  # 1=Monday, 7=Sunday
-
         baseline = {}
         response = s3.list_objects_v2(
             Bucket=BUCKET,
@@ -96,9 +91,10 @@ def get_batch_baseline():
             logger.warning("No batch results found in S3")
             return {}
 
-        # Read all part files
         for obj in response['Contents']:
             if not obj['Key'].endswith('.csv'):
+                continue
+            if '_SUCCESS' in obj['Key']:
                 continue
 
             csv_obj = s3.get_object(Bucket=BUCKET, Key=obj['Key'])
@@ -107,24 +103,22 @@ def get_batch_baseline():
 
             for line in lines[1:]:  # skip header
                 parts = line.split(',')
-                if len(parts) < 5:
+                if len(parts) < 7:
                     continue
                 try:
-                    complaint_type   = parts[0].strip()
-                    borough          = parts[1].strip()
-                    hour             = int(parts[2].strip())
-                    day_of_week      = int(parts[3].strip())
-                    historical_count = int(parts[4].strip())
+                    complaint_type            = parts[0].strip()
+                    borough                   = parts[1].strip()
+                    hour                      = int(parts[2].strip())
+                    day_of_week               = int(parts[3].strip())
+                    avg_count_per_5min_window = float(parts[6].strip())
 
-                    # Only keep rows matching current hour and day
-                    if hour == current_hour and day_of_week == current_dow:
-                        key = f"{complaint_type}|{borough}"
-                        baseline[key] = historical_count
+                    key = (complaint_type, borough, hour, day_of_week)
+                    baseline[key] = avg_count_per_5min_window
 
                 except (ValueError, IndexError):
                     continue
 
-        logger.info(f"Loaded {len(baseline)} baseline entries for hour={current_hour} day={current_dow}")
+        logger.info(f"Loaded {len(baseline)} baseline entries")
         return baseline
 
     except Exception as e:
@@ -135,33 +129,37 @@ def get_batch_baseline():
 def merge_speed_and_batch(speed_results, batch_baseline):
     """
     THE LAMBDA MERGE — combines speed and batch results.
-    Matches current complaints against historical baseline
-    for same complaint_type + borough + hour + day_of_week.
+    Looks up by (complaint_type, borough, hour, day_of_week)
+    Compares against avg_count_per_5min_window for accurate deviation.
     """
     if not speed_results:
         return []
 
+    now          = datetime.now(timezone.utc)
+    current_hour = now.hour
+    current_dow  = now.isoweekday() % 7 + 1
+    top_borough  = speed_results.get('top_borough', 'UNKNOWN')
+
     merged = []
     for complaint in speed_results.get('top5_complaints', []):
-        complaint_type   = complaint['complaint_type']
-        current_count    = complaint['count']
+        complaint_type = complaint['complaint_type']
+        current_count  = complaint['count']
 
-        # Try to match with borough from speed results
-        top_borough      = speed_results.get('top_borough', 'UNKNOWN')
-        key              = f"{complaint_type}|{top_borough}"
-        historical_count = batch_baseline.get(key, 0)
+        # Look up by full segmentation key
+        key            = (complaint_type, top_borough, current_hour, current_dow)
+        historical_avg = batch_baseline.get(key, 0)
 
-        # Also try without borough match
-        if historical_count == 0:
+        # Fallback — try without borough
+        if historical_avg == 0:
             for k, v in batch_baseline.items():
-                if k.startswith(complaint_type):
-                    historical_count = v
+                if k[0] == complaint_type and k[2] == current_hour and k[3] == current_dow:
+                    historical_avg = v
                     break
 
-        # Compute deviation
-        if historical_count > 0:
+        # Compute deviation against avg_count_per_5min_window
+        if historical_avg > 0:
             deviation_pct = round(
-                (current_count - historical_count) / historical_count * 100, 1
+                (current_count - historical_avg) / historical_avg * 100, 1
             )
             is_anomalous = abs(deviation_pct) > 50
         else:
@@ -169,18 +167,17 @@ def merge_speed_and_batch(speed_results, batch_baseline):
             is_anomalous  = False
 
         merged.append({
-            'rank'            : complaint['rank'],
-            'complaint_type'  : complaint_type,
-            'current_count'   : current_count,
-            'historical_count': historical_count,
-            'deviation_pct'   : deviation_pct,
-            'is_anomalous'    : is_anomalous,
-            'window'          : complaint.get('window', 'last_5_minutes'),
-            'status'          : '⚠️ ANOMALY' if is_anomalous else '✓ Normal'
+            'rank'         : complaint['rank'],
+            'complaint_type': complaint_type,
+            'current_count' : current_count,
+            'historical_avg': round(historical_avg, 2),
+            'deviation_pct' : deviation_pct,
+            'is_anomalous'  : is_anomalous,
+            'window'        : complaint.get('window', 'last_5_minutes'),
+            'status'        : '⚠️ ANOMALY' if is_anomalous else '✓ Normal'
         })
 
     return merged
-
 
 # Routes 
 

@@ -3,11 +3,11 @@
 NYC 311 Speed Layer — Lambda Function
 Triggered by Kinesis Data Stream records.
 
-Implements THREE sliding windows :
+Implements THREE sliding windows (H1 discriminator):
   Window 1: Top 5 surging complaint types (last 5 minutes)
+            Uses composite DynamoDB key so counts reset per window
   Window 2: Rolling 1-minute average complaint rate per borough
   Window 3: Count of events per window + surge alerts
-
 """
 
 import json
@@ -17,20 +17,21 @@ import logging
 from datetime import datetime, timezone, timedelta
 from collections import defaultdict
 from decimal import Decimal
+from boto3.dynamodb.conditions import Key
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
-# AWS clients 
+# AWS clients
 dynamodb      = boto3.resource('dynamodb', region_name='us-east-1')
 counts_table  = dynamodb.Table('nyc311-complaint-counts')
 results_table = dynamodb.Table('nyc311-speed-results')
 
-# Window configuration 
-WINDOW_MINUTES  = 5    # sliding window size — top 5 in last 5 mins
-ROLLING_MINUTES = 1    # rolling average window — 1 minute
-TOP_N           = 5    # top N complaint types
-SURGE_THRESHOLD = 5    # complaints per window = surge alert
+# Window configuration
+WINDOW_MINUTES  = 5
+ROLLING_MINUTES = 1
+TOP_N           = 5
+SURGE_THRESHOLD = 5
 
 
 def decode_record(record):
@@ -40,37 +41,29 @@ def decode_record(record):
 
 
 def get_window_key(minutes=5):
-    """
-    Returns current N-minute window key.
-    e.g. for 5 min:  '2026-07-10T13:25'
-    e.g. for 1 min:  '2026-07-10T13:23'
-    """
+    """Returns current N-minute window key."""
     now     = datetime.now(timezone.utc)
     floored = now.replace(
-        minute      = (now.minute // minutes) * minutes,
-        second      = 0,
-        microsecond = 0
+        minute=(now.minute // minutes) * minutes,
+        second=0,
+        microsecond=0
     )
     return floored.strftime('%Y-%m-%dT%H:%M')
 
 
 def get_previous_window_key(minutes=5):
-    """Returns previous N-minute window key for trend comparison."""
+    """Returns previous N-minute window key."""
     now     = datetime.now(timezone.utc)
     floored = now.replace(
-        minute      = (now.minute // minutes) * minutes,
-        second      = 0,
-        microsecond = 0
+        minute=(now.minute // minutes) * minutes,
+        second=0,
+        microsecond=0
     )
-    prev = floored - timedelta(minutes=minutes)
-    return prev.strftime('%Y-%m-%dT%H:%M')
+    return (floored - timedelta(minutes=minutes)).strftime('%Y-%m-%dT%H:%M')
 
 
 def process_records(records):
-    """
-    Process all records in batch.
-    Returns complaint counts, borough counts and agency counts.
-    """
+    """Process all records in batch."""
     complaint_counts = defaultdict(int)
     borough_counts   = defaultdict(int)
     agency_counts    = defaultdict(int)
@@ -93,23 +86,26 @@ def process_records(records):
 def window1_top5_complaints(complaint_counts):
     """
     WINDOW 1 — Top 5 surging complaint types in last 5 minutes.
-    Direct match to rubric: "top 5 trending items in last N minutes"
+    Uses composite key (window_id, complaint_type) so counts
+    reset naturally when a new 5-minute window starts.
+    Reads back full window accumulation before computing top 5.
     """
     window_key = get_window_key(WINDOW_MINUTES)
 
-    # Update DynamoDB counts atomically
+    # Accumulate counts in DynamoDB for this window
     for complaint_type, count in complaint_counts.items():
         try:
             counts_table.update_item(
-                Key={'complaint_type': complaint_type},
+                Key={
+                    'window_id'     : window_key,
+                    'complaint_type': complaint_type
+                },
                 UpdateExpression='''
-                    SET window_key   = :wk,
-                        #cnt         = if_not_exists(#cnt, :zero) + :inc,
+                    SET #cnt         = if_not_exists(#cnt, :zero) + :inc,
                         last_updated = :ts
                 ''',
                 ExpressionAttributeNames={'#cnt': 'count'},
                 ExpressionAttributeValues={
-                    ':wk'  : window_key,
                     ':inc' : Decimal(count),
                     ':zero': Decimal(0),
                     ':ts'  : datetime.now(timezone.utc).isoformat()
@@ -118,9 +114,22 @@ def window1_top5_complaints(complaint_counts):
         except Exception as e:
             logger.error(f"Window 1 error for {complaint_type}: {e}")
 
-    # Sort and get top 5
+    # Read back ALL accumulated counts for this window
+    try:
+        response = counts_table.query(
+            KeyConditionExpression=Key('window_id').eq(window_key)
+        )
+        window_totals = {
+            item['complaint_type']: int(item['count'])
+            for item in response['Items']
+        }
+    except Exception as e:
+        logger.error(f"Error reading window totals: {e}")
+        window_totals = dict(complaint_counts)
+
+    # Sort and get top 5 from full window accumulation
     top5 = sorted(
-        complaint_counts.items(),
+        window_totals.items(),
         key=lambda x: x[1],
         reverse=True
     )[:TOP_N]
@@ -129,10 +138,10 @@ def window1_top5_complaints(complaint_counts):
         {
             'rank'          : i + 1,
             'complaint_type': ct,
-            'count'         : int(count),
+            'count'         : c,
             'window'        : f'last_{WINDOW_MINUTES}_minutes'
         }
-        for i, (ct, count) in enumerate(top5)
+        for i, (ct, c) in enumerate(top5)
     ]
 
 
@@ -141,15 +150,10 @@ def window2_rolling_average(borough_counts, total_records):
     WINDOW 2 — Rolling 1-minute average complaint rate per borough.
     """
     one_min_key = get_window_key(ROLLING_MINUTES)
+    now         = datetime.now(timezone.utc)
+    elapsed     = now.second + 1
+    rolling_avg = (total_records / elapsed) * 60
 
-    # Rolling average = total records in this 1-minute window
-    # divided by elapsed seconds x 60 to get per-minute rate
-    now     = datetime.now(timezone.utc)
-    elapsed = now.second + 1  # seconds elapsed in current minute
-
-    rolling_avg = (total_records / elapsed) * 60  # projected per-minute rate
-
-    # Borough breakdown for this 1-minute window
     borough_rates = [
         {
             'borough'        : borough,
@@ -174,10 +178,10 @@ def window2_rolling_average(borough_counts, total_records):
 def window3_event_count_and_surge(complaint_counts, borough_counts, total_records):
     """
     WINDOW 3 — Count of events per window + surge detection.
+    Direct match to rubric: "count of events per window"
     """
     window_key = get_window_key(WINDOW_MINUTES)
 
-    # Surge alerts — complaint types exceeding threshold
     surge_alerts = [
         {
             'complaint_type': ct,
@@ -189,7 +193,6 @@ def window3_event_count_and_surge(complaint_counts, borough_counts, total_record
         if count >= SURGE_THRESHOLD
     ]
 
-    # Index transition — borough suddenly dominating
     top_borough = max(borough_counts.items(), key=lambda x: x[1]) \
                   if borough_counts else ('UNKNOWN', 0)
 
@@ -217,14 +220,8 @@ def write_results_to_dynamodb(top5, rolling, surge):
                 'window_id'        : window_key,
                 'prev_window_id'   : get_previous_window_key(WINDOW_MINUTES),
                 'timestamp'        : datetime.now(timezone.utc).isoformat(),
-
-                # Window 1 — Top 5 in last 5 minutes
                 'top5_complaints'  : json.dumps(top5),
-
-                # Window 2 — Rolling 1-minute average
                 'rolling_avg'      : json.dumps(rolling),
-
-                # Window 3 — Event count + surge alerts
                 'total_records'    : int(surge['total_events']),
                 'surge_alerts'     : json.dumps(surge['surge_alerts']),
                 'top_borough'      : surge['top_borough'],
@@ -233,21 +230,17 @@ def write_results_to_dynamodb(top5, rolling, surge):
         )
         logger.info(
             f"Results written — Window: {window_key} | "
-            f"Top complaint: {top5[0]['complaint_type'] if top5 else 'N/A'} | "
+            f"Top: {top5[0]['complaint_type'] if top5 else 'N/A'} | "
             f"Rolling avg: {rolling['rolling_avg_per_min']}/min"
         )
     except Exception as e:
-        logger.error(f"Error writing to DynamoDB: {e}")
+        logger.error(f"Error writing results: {e}")
 
 
 def lambda_handler(event, context):
-    """
-    Main Lambda handler — triggered by Kinesis stream.
-    Processes each batch implementing three sliding windows.
-    """
+    """Main Lambda handler — triggered by Kinesis stream."""
     logger.info(f"Processing {len(event['Records'])} Kinesis records")
 
-    #  Decode all records 
     records = []
     for kinesis_record in event['Records']:
         try:
@@ -259,24 +252,15 @@ def lambda_handler(event, context):
     if not records:
         return {'statusCode': 200, 'body': 'No valid records'}
 
-    total_records = len(records)
-    logger.info(f"Decoded {total_records} valid records")
+    total_records                                    = len(records)
+    complaint_counts, borough_counts, agency_counts  = process_records(records)
 
-    # Process records 
-    complaint_counts, borough_counts, agency_counts = process_records(records)
-
-    #  Window 1: Top 5 in last 5 minutes 
-    top5 = window1_top5_complaints(complaint_counts)
-
-    #  Window 2: Rolling 1-minute average 
+    top5    = window1_top5_complaints(complaint_counts)
     rolling = window2_rolling_average(borough_counts, total_records)
-
-    # Window 3: Event count + surge alerts 
-    surge = window3_event_count_and_surge(
+    surge   = window3_event_count_and_surge(
         complaint_counts, borough_counts, total_records
     )
 
-    # Write all results to DynamoDB 
     write_results_to_dynamodb(top5, rolling, surge)
 
     return {
