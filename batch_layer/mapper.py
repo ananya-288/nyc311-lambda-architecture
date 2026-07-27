@@ -16,7 +16,7 @@ for line in sys.stdin:
 
         # Extract fields by index
         complaint_type = fields[5].strip().strip('"')
-        borough        = fields[15].strip().strip('"')
+        borough = fields[10].strip().strip('"')
         created_date   = fields[1].strip().strip('"')
 
         # Skip empty or unknown
