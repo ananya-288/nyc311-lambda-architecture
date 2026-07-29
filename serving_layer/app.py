@@ -76,53 +76,76 @@ def get_speed_layer_results():
 
 def get_batch_baseline():
     """
-    Read historical baseline from S3 batch results.
+    Read historical baseline from Athena.
     Keys on (complaint_type, borough, hour, day_of_week)
     Returns avg_count_per_5min_window for accurate comparison.
     """
     try:
-        baseline = {}
-        response = s3.list_objects_v2(
-            Bucket=BUCKET,
-            Prefix='batch-results/baseline/'
+        athena = boto3.client('athena', region_name='us-east-1')
+
+        now          = datetime.now(timezone.utc)
+        current_hour = now.hour
+        current_dow  = now.isoweekday() % 7 + 1
+
+        # Query Athena for current hour and day baseline
+        query = f"""
+            SELECT complaint_type, borough,
+                   avg_count_per_5min_window
+            FROM nyc311_db.nyc311_baseline
+            WHERE hour = {current_hour}
+            AND day_of_week = {current_dow}
+        """
+
+        response = athena.start_query_execution(
+            QueryString=query,
+            QueryExecutionContext={'Database': 'nyc311_db'},
+            ResultConfiguration={
+                'OutputLocation': 's3://nyc311-athena-results/'
+            }
         )
 
-        if 'Contents' not in response:
-            logger.warning("No batch results found in S3")
-            return {}
+        query_id = response['QueryExecutionId']
 
-        for obj in response['Contents']:
-            if not obj['Key'].endswith('.csv'):
-                continue
-            if '_SUCCESS' in obj['Key']:
-                continue
+        # Wait for query to complete
+        import time
+        for _ in range(30):
+            status = athena.get_query_execution(
+                QueryExecutionId=query_id
+            )['QueryExecution']['Status']['State']
 
-            csv_obj = s3.get_object(Bucket=BUCKET, Key=obj['Key'])
-            content = csv_obj['Body'].read().decode('utf-8')
-            lines   = content.strip().split('\n')
+            if status == 'SUCCEEDED':
+                break
+            elif status in ('FAILED', 'CANCELLED'):
+                logger.error(f"Athena query failed: {status}")
+                return {}
+            time.sleep(1)
 
-            for line in lines[1:]:  # skip header
-                parts = line.split(',')
-                if len(parts) < 7:
-                    continue
+        # Get results
+        results = athena.get_query_results(
+            QueryExecutionId=query_id
+        )
+
+        baseline = {}
+        rows = results['ResultSet']['Rows']
+
+        for row in rows[1:]:  # skip header
+            values = [col.get('VarCharValue', '') for col in row['Data']]
+            if len(values) >= 3:
                 try:
-                    complaint_type            = parts[0].strip()
-                    borough                   = parts[1].strip()
-                    hour                      = int(parts[2].strip())
-                    day_of_week               = int(parts[3].strip())
-                    avg_count_per_5min_window = float(parts[6].strip())
-
-                    key = (complaint_type, borough, hour, day_of_week)
+                    complaint_type            = values[0]
+                    borough                   = values[1]
+                    avg_count_per_5min_window = float(values[2])
+                    key = (complaint_type, borough, current_hour, current_dow)
                     baseline[key] = avg_count_per_5min_window
-
                 except (ValueError, IndexError):
                     continue
 
-        logger.info(f"Loaded {len(baseline)} baseline entries")
+        logger.info(f"Athena returned {len(baseline)} baseline entries "
+                   f"for hour={current_hour} day={current_dow}")
         return baseline
 
     except Exception as e:
-        logger.error(f"Error reading batch baseline: {e}")
+        logger.error(f"Athena query error: {e}")
         return {}
 
 
