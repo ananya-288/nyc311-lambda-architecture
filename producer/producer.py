@@ -88,12 +88,10 @@ def run_producer(delay, max_records, stream_name):
     """
     Main loop — replay dataset into Kinesis at controlled rate.
     """
-    logger.info("=" * 60)
     logger.info("NYC 311 COMPLAINT STREAM PRODUCER")
     logger.info(f"  Stream      : {stream_name}")
     logger.info(f"  Replay delay: {delay}s per record")
     logger.info(f"  Max records : {max_records if max_records else 'unlimited'}")
-    logger.info("=" * 60)
 
     total_sent   = 0
     total_errors = 0
@@ -145,13 +143,11 @@ def run_producer(delay, max_records, stream_name):
 
     finally:
         elapsed = time.time() - start_time
-        logger.info("=" * 60)
         logger.info("PRODUCER SUMMARY")
         logger.info(f"  Total sent  : {total_sent:,}")
         logger.info(f"  Total errors: {total_errors}")
         logger.info(f"  Elapsed     : {elapsed:.0f}s")
         logger.info(f"  Avg rate    : {total_sent/elapsed:.2f} rec/s")
-        logger.info("=" * 60)
 
 
 # Entry point

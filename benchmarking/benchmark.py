@@ -105,10 +105,9 @@ def run_benchmark():
     worker_counts = [1, 2, 3, 4]
     results       = []
 
-    logger.info("=" * 60)
+  
     logger.info("NYC 311 EMR BENCHMARK")
-    logger.info("=" * 60)
-
+   
     for num_workers in worker_counts:
         logger.info(f"\nBenchmark run: {num_workers} worker(s)")
 
@@ -133,11 +132,9 @@ def run_benchmark():
     # Calculate speedup 
     baseline_time = results[0]['duration_s']  # 1 worker = baseline
 
-    logger.info("\n" + "=" * 60)
+  
     logger.info("BENCHMARK RESULTS")
-    logger.info("=" * 60)
     logger.info(f"{'Workers':<10} {'Time (s)':<12} {'Speedup':<10} {'Status'}")
-    logger.info("-" * 50)
 
     for r in results:
         speedup = baseline_time / r['duration_s']
