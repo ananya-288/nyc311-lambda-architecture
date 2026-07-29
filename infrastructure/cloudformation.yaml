@@ -1,0 +1,197 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  NYC 311 Real-Time Complaint Surge Detection
+
+Parameters:
+  BucketName:
+    Type: String
+    Default: nyc311-lambda-architecture
+    Description: S3 bucket containing dataset and scripts
+
+  WorkerCount:
+    Type: Number
+    Default: 2
+    AllowedValues: [1, 2, 3, 4]
+    Description: Number of EMR worker nodes
+
+Resources:
+
+  # Kinesis Data Stream 
+  NYC311KinesisStream:
+    Type: AWS::Kinesis::Stream
+    Properties:
+      Name: nyc311-complaint-stream
+      ShardCount: 1
+      Tags:
+        - Key: Project
+          Value: NYC311-Lambda-Architecture
+
+  #  DynamoDB — Speed Results 
+  NYC311SpeedResults:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: nyc311-speed-results
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: window_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: window_id
+          KeyType: HASH
+      Tags:
+        - Key: Project
+          Value: NYC311-Lambda-Architecture
+
+  # DynamoDB — Complaint Counts (composite key) 
+  NYC311ComplaintCounts:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: nyc311-complaint-counts
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: window_id
+          AttributeType: S
+        - AttributeName: complaint_type
+          AttributeType: S
+      KeySchema:
+        - AttributeName: window_id
+          KeyType: HASH
+        - AttributeName: complaint_type
+          KeyType: RANGE
+      Tags:
+        - Key: Project
+          Value: NYC311-Lambda-Architecture
+
+  #  SNS Topic — Surge Alerts 
+  NYC311SurgeTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: nyc311-surge-alerts
+      DisplayName: NYC311 Complaint Surge Alerts
+      Tags:
+        - Key: Project
+          Value: NYC311-Lambda-Architecture
+
+  # Kinesis Firehose → S3 
+  NYC311Firehose:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    Properties:
+      DeliveryStreamName: nyc311-firehose
+      DeliveryStreamType: KinesisStreamAsSource
+      KinesisStreamSourceConfiguration:
+        KinesisStreamARN: !GetAtt NYC311KinesisStream.Arn
+        RoleARN: !Sub arn:aws:iam::${AWS::AccountId}:role/LabRole
+      S3DestinationConfiguration:
+        BucketARN: !Sub arn:aws:s3:::${BucketName}
+        Prefix: firehose-output/
+        ErrorOutputPrefix: firehose-errors/
+        RoleARN: !Sub arn:aws:iam::${AWS::AccountId}:role/LabRole
+        BufferingHints:
+          SizeInMBs: 5
+          IntervalInSeconds: 60
+
+  # EMR Cluster — Batch Layer 
+  NYC311EMRCluster:
+    Type: AWS::EMR::Cluster
+    Properties:
+      Name: NYC311-Batch-Baseline
+      ReleaseLabel: emr-6.7.0
+      Applications:
+        - Name: Hadoop
+        - Name: Spark
+        - Name: Hive
+      Instances:
+        MasterInstanceGroup:
+          InstanceCount: 1
+          InstanceType: m5.xlarge
+          Market: ON_DEMAND
+          Name: Master
+        CoreInstanceGroup:
+          InstanceCount: !Ref WorkerCount
+          InstanceType: m5.xlarge
+          Market: ON_DEMAND
+          Name: Workers
+        TerminationProtected: false
+        KeepJobFlowAliveWhenNoSteps: false
+      Steps:
+        - Name: NYC311-Spark-Batch-Job
+          ActionOnFailure: TERMINATE_CLUSTER
+          HadoopJarStep:
+            Jar: command-runner.jar
+            Args:
+              - spark-submit
+              - --deploy-mode
+              - cluster
+              - !Sub s3://${BucketName}/scripts/spark_job.py
+      JobFlowRole: EMR_EC2_DefaultRole
+      ServiceRole: EMR_DefaultRole
+      LogUri: !Sub s3://${BucketName}/emr-logs/
+      AutoTerminationPolicy:
+        IdleTimeout: 3600
+      Tags:
+        - Key: Project
+          Value: NYC311-Lambda-Architecture
+
+  # EC2 Auto Scaling — Serving Layer 
+  NYC311LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: NYC311-Flask-Template
+      LaunchTemplateData:
+        ImageId: ami-0df80e66b6b8a0056
+        InstanceType: t2.micro
+        KeyName: vockey
+        UserData:
+          Fn::Base64: |
+            #!/bin/bash
+            yum update -y
+            yum install python3 python3-pip -y
+            pip3 install flask boto3
+
+  NYC311AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: NYC311-FlaskASG
+      LaunchTemplate:
+        LaunchTemplateId: !Ref NYC311LaunchTemplate
+        Version: !GetAtt NYC311LaunchTemplate.LatestVersionNumber
+      MinSize: 0
+      MaxSize: 4
+      DesiredCapacity: 0
+      VPCZoneIdentifier:
+        - subnet-099731c62af86920d
+      Tags:
+        - Key: Project
+          Value: NYC311-Lambda-Architecture
+          PropagateAtLaunch: true
+
+  NYC311ScalingPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref NYC311AutoScalingGroup
+      PolicyType: TargetTrackingScaling
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ASGAverageCPUUtilization
+        TargetValue: 60.0
+
+Outputs:
+  KinesisStreamName:
+    Description: Kinesis stream name
+    Value: !Ref NYC311KinesisStream
+
+  SpeedResultsTable:
+    Description: DynamoDB speed results table
+    Value: !Ref NYC311SpeedResults
+
+  ComplaintCountsTable:
+    Description: DynamoDB complaint counts table
+    Value: !Ref NYC311ComplaintCounts
+
+  SNSTopicArn:
+    Description: SNS topic for surge alerts
+    Value: !Ref NYC311SurgeTopic
+
+  EMRClusterId:
+    Description: EMR cluster ID
+    Value: !Ref NYC311EMRCluster
