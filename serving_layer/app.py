@@ -2,63 +2,44 @@
 """
 NYC 311 Serving Layer — Flask Application
 Combines speed layer (DynamoDB) and batch layer (S3/Athena)
-to produce coherent merged dashboard.
-
-This is the Lambda Architecture "merge" — combining:
-  - Real-time top 5 surging complaints (from Lambda/DynamoDB)
-  - Historical baselines (from EMR/S3)
-  - Deviation analysis (anomaly detection)
-
 """
 
-from flask import Flask, jsonify, render_template_string
+from flask import Flask, jsonify, render_template, request, Response
 import boto3
 import json
+import csv
+import io
 import logging
+import time
 from datetime import datetime, timezone
 from decimal import Decimal
 
-# Logging 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Flask app 
 app = Flask(__name__)
 
-# AWS clients 
 dynamodb      = boto3.resource('dynamodb', region_name='us-east-1')
 s3            = boto3.client('s3',         region_name='us-east-1')
 results_table = dynamodb.Table('nyc311-speed-results')
-counts_table  = dynamodb.Table('nyc311-complaint-counts')
 
 BUCKET = 'nyc311-lambda-architecture'
 
 
-# Helper 
 def decimal_to_float(obj):
-    """Convert DynamoDB Decimal to float for JSON serialisation."""
     if isinstance(obj, Decimal):
         return float(obj)
     raise TypeError
 
 
 def get_speed_layer_results():
-    """
-    Read latest speed layer results from DynamoDB.
-    Returns top 5 complaints, rolling average, surge alerts.
-    """
     try:
-        # Scan for most recent window
         response = results_table.scan(Limit=10)
         items    = response.get('Items', [])
-
         if not items:
             return None
-
-        # Sort by timestamp — get most recent
         items.sort(key=lambda x: x.get('timestamp', ''), reverse=True)
         latest = items[0]
-
         return {
             'window_id'        : latest.get('window_id', 'N/A'),
             'timestamp'        : latest.get('timestamp', 'N/A'),
@@ -69,28 +50,20 @@ def get_speed_layer_results():
             'top_borough'      : latest.get('top_borough', 'N/A'),
             'borough_dominance': latest.get('borough_dominance', '0%'),
         }
-
     except Exception as e:
         logger.error(f"Error reading speed layer: {e}")
         return None
 
-def get_batch_baseline():
-    """
-    Read historical baseline from Athena.
-    Keys on (complaint_type, borough, hour, day_of_week)
-    Returns avg_count_per_5min_window for accurate comparison.
-    """
-    try:
-        athena = boto3.client('athena', region_name='us-east-1')
 
+def get_batch_baseline():
+    try:
+        athena       = boto3.client('athena', region_name='us-east-1')
         now          = datetime.now(timezone.utc)
         current_hour = now.hour
         current_dow  = now.isoweekday() % 7 + 1
 
-        # Query Athena for current hour and day baseline
         query = f"""
-            SELECT complaint_type, borough,
-                   avg_count_per_5min_window
+            SELECT complaint_type, borough, avg_count_per_5min_window
             FROM nyc311_db.nyc311_baseline
             WHERE hour = {current_hour}
             AND day_of_week = {current_dow}
@@ -99,62 +72,93 @@ def get_batch_baseline():
         response = athena.start_query_execution(
             QueryString=query,
             QueryExecutionContext={'Database': 'nyc311_db'},
-            ResultConfiguration={
-                'OutputLocation': 's3://nyc311-athena-results/'
-            }
+            ResultConfiguration={'OutputLocation': 's3://nyc311-athena-results/'}
         )
-
         query_id = response['QueryExecutionId']
 
-        # Wait for query to complete
-        import time
         for _ in range(30):
             status = athena.get_query_execution(
                 QueryExecutionId=query_id
             )['QueryExecution']['Status']['State']
-
             if status == 'SUCCEEDED':
                 break
             elif status in ('FAILED', 'CANCELLED'):
-                logger.error(f"Athena query failed: {status}")
                 return {}
             time.sleep(1)
 
-        # Get results
-        results = athena.get_query_results(
-            QueryExecutionId=query_id
-        )
-
+        results  = athena.get_query_results(QueryExecutionId=query_id)
         baseline = {}
-        rows = results['ResultSet']['Rows']
-
-        for row in rows[1:]:  # skip header
+        for row in results['ResultSet']['Rows'][1:]:
             values = [col.get('VarCharValue', '') for col in row['Data']]
             if len(values) >= 3:
                 try:
-                    complaint_type            = values[0]
-                    borough                   = values[1]
-                    avg_count_per_5min_window = float(values[2])
-                    key = (complaint_type, borough, current_hour, current_dow)
-                    baseline[key] = avg_count_per_5min_window
+                    key = (values[0], values[1], current_hour, current_dow)
+                    baseline[key] = float(values[2])
                 except (ValueError, IndexError):
                     continue
 
-        logger.info(f"Athena returned {len(baseline)} baseline entries "
-                   f"for hour={current_hour} day={current_dow}")
+        logger.info(f"Athena returned {len(baseline)} baseline entries")
         return baseline
-
     except Exception as e:
-        logger.error(f"Athena query error: {e}")
+        logger.error(f"Athena error: {e}")
         return {}
 
 
+def get_batch_top5():
+    try:
+        response = s3.list_objects_v2(Bucket=BUCKET, Prefix='batch-results/top5-overall/')
+        if 'Contents' not in response:
+            return []
+        for obj in response['Contents']:
+            if obj['Key'].endswith('.csv') and 'part-' in obj['Key']:
+                content = s3.get_object(Bucket=BUCKET, Key=obj['Key'])['Body'].read().decode('utf-8')
+                lines   = content.strip().split('\n')
+                result  = []
+                for line in lines[1:]:
+                    parts = line.split(',')
+                    if len(parts) >= 2:
+                        try:
+                            result.append({
+                                'complaint_type': parts[0].strip(),
+                                'total_count'   : int(parts[1].strip())
+                            })
+                        except (ValueError, IndexError):
+                            continue
+                return result[:5]
+        return []
+    except Exception as e:
+        logger.error(f"Error reading batch top5: {e}")
+        return []
+
+
+def get_batch_borough_summary():
+    try:
+        response = s3.list_objects_v2(Bucket=BUCKET, Prefix='batch-results/borough-summary/')
+        if 'Contents' not in response:
+            return []
+        for obj in response['Contents']:
+            if obj['Key'].endswith('.csv') and 'part-' in obj['Key']:
+                content = s3.get_object(Bucket=BUCKET, Key=obj['Key'])['Body'].read().decode('utf-8')
+                lines   = content.strip().split('\n')
+                result  = []
+                for line in lines[1:]:
+                    parts = line.split(',')
+                    if len(parts) >= 2:
+                        try:
+                            result.append({
+                                'borough'         : parts[0].strip(),
+                                'total_complaints': int(parts[1].strip()),
+                            })
+                        except (ValueError, IndexError):
+                            continue
+                return result
+        return []
+    except Exception as e:
+        logger.error(f"Error reading borough summary: {e}")
+        return []
+
+
 def merge_speed_and_batch(speed_results, batch_baseline):
-    """
-    THE LAMBDA MERGE — combines speed and batch results.
-    Looks up by (complaint_type, borough, hour, day_of_week)
-    Compares against avg_count_per_5min_window for accurate deviation.
-    """
     if not speed_results:
         return []
 
@@ -168,18 +172,15 @@ def merge_speed_and_batch(speed_results, batch_baseline):
         complaint_type = complaint['complaint_type']
         current_count  = complaint['count']
 
-        # Look up by full segmentation key
         key            = (complaint_type, top_borough, current_hour, current_dow)
         historical_avg = batch_baseline.get(key, 0)
 
-        # Fallback — try without borough
         if historical_avg == 0:
             for k, v in batch_baseline.items():
                 if k[0] == complaint_type and k[2] == current_hour and k[3] == current_dow:
                     historical_avg = v
                     break
 
-        # Compute deviation against avg_count_per_5min_window
         if historical_avg > 0:
             deviation_pct = round(
                 (current_count - historical_avg) / historical_avg * 100, 1
@@ -190,168 +191,151 @@ def merge_speed_and_batch(speed_results, batch_baseline):
             is_anomalous  = False
 
         merged.append({
-            'rank'         : complaint['rank'],
+            'rank'          : complaint['rank'],
             'complaint_type': complaint_type,
             'current_count' : current_count,
             'historical_avg': round(historical_avg, 2),
             'deviation_pct' : deviation_pct,
             'is_anomalous'  : is_anomalous,
             'window'        : complaint.get('window', 'last_5_minutes'),
-            'status'        : '⚠️ ANOMALY' if is_anomalous else '✓ Normal'
+            'status'        : 'ANOMALY' if is_anomalous else 'Normal'
         })
 
     return merged
 
-# Routes 
+
+# API Routes 
 
 @app.route('/health')
 def health():
-    """Health check endpoint."""
-    return jsonify({'status': 'healthy', 'timestamp': datetime.now(timezone.utc).isoformat()})
+    return jsonify({
+        'status'   : 'healthy',
+        'timestamp': datetime.now(timezone.utc).isoformat()
+    })
 
 
 @app.route('/api/speed')
 def api_speed():
-    """Raw speed layer results from DynamoDB."""
     results = get_speed_layer_results()
     if not results:
-        return jsonify({'error': 'No speed layer results available'}), 404
+        return jsonify({'error': 'No speed layer results'}), 404
     return jsonify(json.loads(json.dumps(results, default=decimal_to_float)))
 
 
 @app.route('/api/batch')
 def api_batch():
-    """Raw batch baseline from S3."""
-    baseline = get_batch_baseline()
-    return jsonify({'baseline_complaint_types': len(baseline), 'sample': dict(list(baseline.items())[:5])})
+    return jsonify({
+        'top5_alltime'   : get_batch_top5(),
+        'borough_summary': get_batch_borough_summary()
+    })
 
 
 @app.route('/api/merged')
 def api_merged():
-    """
-    THE LAMBDA MERGE endpoint.
-    Combines speed + batch results into one coherent view.
-    """
     speed_results  = get_speed_layer_results()
     batch_baseline = get_batch_baseline()
     merged         = merge_speed_and_batch(speed_results, batch_baseline)
+
+    anomalous_only = request.args.get('anomalous', 'false') == 'true'
+    severity       = request.args.get('severity', 'all')
+
+    surge_alerts = speed_results.get('surge_alerts', []) if speed_results else []
+
+    if severity != 'all':
+        surge_alerts = [a for a in surge_alerts
+                        if a.get('severity', '').upper() == severity.upper()]
+    if anomalous_only:
+        merged = [m for m in merged if m['is_anomalous']]
 
     return jsonify({
         'window_id'        : speed_results.get('window_id') if speed_results else 'N/A',
         'timestamp'        : datetime.now(timezone.utc).isoformat(),
         'top5_merged'      : merged,
         'rolling_avg'      : speed_results.get('rolling_avg') if speed_results else {},
-        'surge_alerts'     : speed_results.get('surge_alerts') if speed_results else [],
+        'surge_alerts'     : surge_alerts,
         'top_borough'      : speed_results.get('top_borough') if speed_results else 'N/A',
         'borough_dominance': speed_results.get('borough_dominance') if speed_results else '0%',
         'total_records'    : speed_results.get('total_records') if speed_results else 0,
     })
 
 
-@app.route('/')
-def dashboard():
-    """Main dashboard — shows merged batch + speed results."""
+@app.route('/api/export/merged')
+def export_merged():
     speed_results  = get_speed_layer_results()
     batch_baseline = get_batch_baseline()
     merged         = merge_speed_and_batch(speed_results, batch_baseline)
+    anomalous_only = request.args.get('anomalous', 'false') == 'true'
+    if anomalous_only:
+        merged = [m for m in merged if m['is_anomalous']]
 
-    html = """
-<!DOCTYPE html>
-<html>
-<head>
-    <title>NYC 311 Complaint Surge Detection</title>
-    <meta http-equiv="refresh" content="30">
-    <style>
-        body { font-family: Arial, sans-serif; margin: 20px; background: #f5f5f5; }
-        h1   { color: #333; }
-        .card { background: white; padding: 20px; margin: 10px 0;
-                border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
-        table { width: 100%; border-collapse: collapse; }
-        th    { background: #2c3e50; color: white; padding: 10px; text-align: left; }
-        td    { padding: 10px; border-bottom: 1px solid #ddd; }
-        .anomaly { background: #ffe6e6; color: #c0392b; font-weight: bold; }
-        .normal  { background: #e6ffe6; color: #27ae60; }
-        .metric  { font-size: 2em; font-weight: bold; color: #2c3e50; }
-        .label   { color: #7f8c8d; font-size: 0.9em; }
-    </style>
-</head>
-<body>
-    <h1>🗽 NYC 311 Real-Time Complaint Surge Detection</h1>
-    <p><b>Lambda Architecture</b> — Speed Layer (DynamoDB) + Batch Layer (S3) Merged View</p>
-    <p>Auto-refreshes every 30 seconds | 
-       Window: {{ window_id }} | 
-       Updated: {{ timestamp }}</p>
+    output = io.StringIO()
+    writer = csv.DictWriter(output, fieldnames=[
+        'rank', 'complaint_type', 'current_count',
+        'historical_avg', 'deviation_pct', 'is_anomalous', 'status'
+    ])
+    writer.writeheader()
+    writer.writerows(merged)
 
-    <!-- Speed Layer Summary -->
-    <div class="card">
-        <h2>⚡ Speed Layer — Live Metrics (Last 5 Minutes)</h2>
-        <table>
-            <tr>
-                <td>
-                    <div class="metric">{{ total_records }}</div>
-                    <div class="label">Records in window</div>
-                </td>
-                <td>
-                    <div class="metric">{{ rolling_avg }}</div>
-                    <div class="label">Rolling avg (per min)</div>
-                </td>
-                <td>
-                    <div class="metric">{{ top_borough }}</div>
-                    <div class="label">Top borough ({{ borough_dominance }})</div>
-                </td>
-                <td>
-                    <div class="metric">{{ surge_count }}</div>
-                    <div class="label">Active surge alerts</div>
-                </td>
-            </tr>
-        </table>
-    </div>
+    ts = datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')
+    return Response(
+        output.getvalue(),
+        mimetype='text/csv',
+        headers={'Content-Disposition': f'attachment; filename=nyc311_merged_{ts}.csv'}
+    )
 
-    <!-- Merged View — Lambda Merge -->
-    <div class="card">
-        <h2>🔀 Lambda Merge — Current vs Historical Baseline</h2>
-        <p>Combining real-time speed layer with EMR batch baseline</p>
-        <table>
-            <tr>
-                <th>Rank</th>
-                <th>Complaint Type</th>
-                <th>Now (5 min)</th>
-                <th>Historical Avg</th>
-                <th>Deviation</th>
-                <th>Status</th>
-            </tr>
-            {% for item in merged %}
-            <tr class="{{ 'anomaly' if item.is_anomalous else 'normal' }}">
-                <td>{{ item.rank }}</td>
-                <td>{{ item.complaint_type }}</td>
-                <td>{{ item.current_count }}</td>
-                <td>{{ item.historical_count }}</td>
-                <td>{{ item.deviation_pct }}%</td>
-                <td>{{ item.status }}</td>
-            </tr>
-            {% endfor %}
-        </table>
-    </div>
 
-    <!-- Surge Alerts -->
-    {% if surge_alerts %}
-    <div class="card">
-        <h2>🚨 Active Surge Alerts</h2>
-        {% for alert in surge_alerts %}
-        <p class="anomaly">
-            {{ alert.complaint_type }} — 
-            {{ alert.count }} complaints 
-            ({{ alert.severity }} severity)
-        </p>
-        {% endfor %}
-    </div>
-    {% endif %}
+@app.route('/api/export/alerts')
+def export_alerts():
+    speed_results = get_speed_layer_results()
+    surge_alerts  = speed_results.get('surge_alerts', []) if speed_results else []
+    severity      = request.args.get('severity', 'all')
+    if severity != 'all':
+        surge_alerts = [a for a in surge_alerts
+                        if a.get('severity', '').upper() == severity.upper()]
 
-</body>
-</html>
-"""
+    output = io.StringIO()
+    writer = csv.DictWriter(output, fieldnames=[
+        'complaint_type', 'count', 'severity', 'threshold'
+    ])
+    writer.writeheader()
+    writer.writerows(surge_alerts)
 
-    # Prepare template variables
+    ts = datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')
+    return Response(
+        output.getvalue(),
+        mimetype='text/csv',
+        headers={'Content-Disposition': f'attachment; filename=nyc311_alerts_{ts}.csv'}
+    )
+
+
+@app.route('/api/export/baseline')
+def export_baseline():
+    batch_baseline = get_batch_baseline()
+    output         = io.StringIO()
+    writer         = csv.writer(output)
+    writer.writerow([
+        'complaint_type', 'borough', 'hour',
+        'day_of_week', 'avg_count_per_5min_window'
+    ])
+    for (ct, borough, hour, dow), avg in batch_baseline.items():
+        writer.writerow([ct, borough, hour, dow, avg])
+
+    ts = datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')
+    return Response(
+        output.getvalue(),
+        mimetype='text/csv',
+        headers={'Content-Disposition': f'attachment; filename=nyc311_baseline_{ts}.csv'}
+    )
+
+
+@app.route('/')
+def dashboard():
+    speed_results  = get_speed_layer_results()
+    batch_baseline = get_batch_baseline()
+    merged         = merge_speed_and_batch(speed_results, batch_baseline)
+    batch_top5     = get_batch_top5()
+    batch_boroughs = get_batch_borough_summary()
+
     rolling_avg   = 'N/A'
     window_id     = 'N/A'
     total_records = 0
@@ -359,6 +343,8 @@ def dashboard():
     borough_dom   = '0%'
     surge_alerts  = []
     surge_count   = 0
+    borough_rates = []
+    max_rate      = 1
 
     if speed_results:
         window_id     = speed_results.get('window_id', 'N/A')
@@ -368,24 +354,30 @@ def dashboard():
         surge_alerts  = speed_results.get('surge_alerts', [])
         surge_count   = len(surge_alerts)
         rolling       = speed_results.get('rolling_avg', {})
-        rolling_avg   = rolling.get('rolling_avg_per_min', 'N/A') if rolling else 'N/A'
+        if rolling:
+            rolling_avg   = rolling.get('rolling_avg_per_min', 'N/A')
+            borough_rates = rolling.get('borough_rates', [])
+            if borough_rates:
+                max_rate = max(b.get('projected_rate', 1) for b in borough_rates) or 1
 
-    from flask import render_template_string
-    return render_template_string(
-        html,
-        merged           = merged,
-        window_id        = window_id,
-        timestamp        = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC'),
-        total_records    = total_records,
-        rolling_avg      = rolling_avg,
-        top_borough      = top_borough,
-        borough_dominance= borough_dom,
-        surge_alerts     = surge_alerts,
-        surge_count      = surge_count
+    return render_template(
+        'dashboard.html',
+        merged            = merged,
+        window_id         = window_id,
+        timestamp         = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC'),
+        total_records     = total_records,
+        rolling_avg       = rolling_avg,
+        top_borough       = top_borough,
+        borough_dominance = borough_dom,
+        surge_alerts      = surge_alerts,
+        surge_count       = surge_count,
+        borough_rates     = borough_rates,
+        max_rate          = max_rate,
+        batch_top5        = batch_top5,
+        batch_boroughs    = batch_boroughs,
     )
 
 
 if __name__ == '__main__':
     logger.info("Starting NYC 311 Serving Layer...")
-    logger.info("Dashboard: http://0.0.0.0:5000")
     app.run(host='0.0.0.0', port=5000, debug=False)
