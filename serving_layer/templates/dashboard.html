@@ -9,17 +9,19 @@
 </head>
 <body>
 
-<!-- Header -->
 <div class="header">
     <div class="header-left">
         <h1>🗽 NYC 311 Real-Time Complaint Surge Detection</h1>
-        <p>Live complaints compared against 6-year historical baseline — Updated every 30 seconds</p>
+        <p>
+            Speed Layer (last 5 min) compared against
+            Batch Layer (historical average for this hour and day)
+        </p>
     </div>
     <div class="header-right">
         <span class="live-badge">● LIVE</span>
         <div class="timestamp">
-            Current Window: {{ window_id }}<br>
-            Last Updated: {{ timestamp }}
+            Window: {{ window_id }}<br>
+            Updated: {{ timestamp }}
         </div>
     </div>
 </div>
@@ -50,9 +52,34 @@
         </div>
     </div>
 
+    <!-- Surge Alerts — show only if active -->
+    {% if surge_alerts %}
+    <div class="card">
+        <div class="card-header">
+            <span class="card-title">🚨 Active Surge Alerts</span>
+            <span class="card-badge">{{ surge_count }} requiring attention</span>
+        </div>
+        <div class="two-col">
+            {% for alert in surge_alerts %}
+            <div class="surge-alert surge-{{ alert.severity | lower }}">
+                <div>
+                    <div class="surge-name">{{ alert.complaint_type }}</div>
+                    <div class="surge-count">
+                        {{ alert.count }} complaints in current window
+                    </div>
+                </div>
+                <span class="severity-badge sev-{{ alert.severity | lower }}">
+                    {{ alert.severity }}
+                </span>
+            </div>
+            {% endfor %}
+        </div>
+    </div>
+    {% endif %}
+
     <!-- Filters + Export -->
     <div class="filter-bar">
-        <span class="filter-title">🔍 Filter Results</span>
+        <span class="filter-title">🔍 Filter</span>
         <div>
             <label>Borough</label>
             <select id="boroughFilter">
@@ -62,14 +89,6 @@
                 <option value="QUEENS">Queens</option>
                 <option value="BRONX">Bronx</option>
                 <option value="STATEN ISLAND">Staten Island</option>
-            </select>
-        </div>
-        <div>
-            <label>Alert Severity</label>
-            <select id="severityFilter">
-                <option value="all">All Severities</option>
-                <option value="HIGH">High Only</option>
-                <option value="MEDIUM">Medium Only</option>
             </select>
         </div>
         <div>
@@ -85,46 +104,24 @@
         </div>
         <div class="filter-actions">
             <button class="filter-btn" onclick="applyFilters()">Apply</button>
-            <button class="reset-btn"  onclick="resetFilters()">Reset</button>
+            <button class="reset-btn" onclick="resetFilters()">Reset</button>
         </div>
         <div class="export-actions">
-            <a href="/api/export/merged"   class="export-btn">⬇ Export Results</a>
-            <a href="/api/export/alerts"   class="export-btn">⬇ Export Alerts</a>
-            <a href="/api/export/baseline" class="export-btn">⬇ Export Baseline</a>
+            <a href="/api/export/merged" class="export-btn">⬇ Export Results CSV</a>
+            <a href="/api/export/alerts" class="export-btn">⬇ Export Alerts CSV</a>
         </div>
     </div>
 
-    <!-- Surge Alerts — most important, show first -->
-    {% if surge_alerts %}
+    <!-- Main Merge Table -->
     <div class="card">
         <div class="card-header">
-            <span class="card-title">🚨 Active Surge Alerts</span>
-            <span class="card-badge">{{ surge_count }} requiring attention</span>
-        </div>
-        <div class="two-col">
-        {% for alert in surge_alerts %}
-        <div class="surge-alert surge-{{ alert.severity | lower }}">
-            <div>
-                <div class="surge-name">{{ alert.complaint_type }}</div>
-                <div class="surge-count">
-                    {{ alert.count }} complaints in current window
-                    — {{ alert.severity }} volume
-                </div>
-            </div>
-            <span class="severity-badge sev-{{ alert.severity | lower }}">
-                {{ alert.severity }}
+            <span class="card-title">
+                📊 Top 5 Surging Complaints —
+                Speed Layer vs Batch Layer Baseline
             </span>
-        </div>
-        {% endfor %}
-        </div>
-    </div>
-    {% endif %}
-
-    <!-- Current vs Historical — the key insight -->
-    <div class="card">
-        <div class="card-header">
-            <span class="card-title">📊 Current Complaints vs Historical Average</span>
-            <span class="card-badge">Last 5 minutes vs 6-year baseline</span>
+            <span class="card-badge">
+                Last 5 minutes vs historical avg for this hour and day
+            </span>
         </div>
         {% if merged %}
         <table id="mergeTable">
@@ -132,9 +129,9 @@
                 <tr>
                     <th>Rank</th>
                     <th>Complaint Type</th>
-                    <th>Right Now (5 min)</th>
-                    <th>Historically Normal</th>
-                    <th>How Unusual?</th>
+                    <th>⚡ Right Now (Speed Layer)</th>
+                    <th>📊 Historical Avg (Batch Layer)</th>
+                    <th>Deviation</th>
                     <th>Assessment</th>
                 </tr>
             </thead>
@@ -144,7 +141,9 @@
                 data-anomalous="{{ item.is_anomalous|lower }}"
                 data-type="{{ item.complaint_type }}">
                 <td>
-                    <span class="rank-badge rank-{{ item.rank }}">{{ item.rank }}</span>
+                    <span class="rank-badge rank-{{ item.rank }}">
+                        {{ item.rank }}
+                    </span>
                 </td>
                 <td class="complaint-name">{{ item.complaint_type }}</td>
                 <td class="count-now">{{ item.current_count }} complaints</td>
@@ -157,8 +156,11 @@
                     {% endif %}
                 </td>
                 <td>
-                    <span class="anomaly-badge {% if item.is_anomalous %}anomaly-true{% else %}anomaly-false{% endif %}">
-                        {% if item.is_anomalous %}⚠ Unusual{% else %}✓ Expected{% endif %}
+                    <span class="anomaly-badge
+                        {% if item.is_anomalous %}anomaly-true
+                        {% else %}anomaly-false{% endif %}">
+                        {% if item.is_anomalous %}⚠ Unusual
+                        {% else %}✓ Expected{% endif %}
                     </span>
                 </td>
             </tr>
@@ -167,20 +169,22 @@
         </table>
         {% else %}
         <div class="no-data">
-            No complaints detected in the current window.<br>
-            Start the data producer to see live results.
+            No complaints in current window.<br>
+            Start the producer to see live results.
         </div>
         {% endif %}
     </div>
 
-    <!-- Two column: live borough + historical top 5 -->
+    <!-- Speed Layer + Batch Layer side by side -->
     <div class="two-col">
 
-        <!-- Live Borough Breakdown -->
+        <!-- Speed Layer — live borough -->
         <div class="card">
             <div class="card-header">
-                <span class="card-title">📍 Where Are Complaints Coming From?</span>
-                <span class="card-badge">Last 1 minute · live</span>
+                <span class="card-title">
+                    ⚡ Speed Layer — Live Borough Breakdown
+                </span>
+                <span class="card-badge">Last 1 minute</span>
             </div>
             {% if borough_rates %}
                 {% for b in borough_rates %}
@@ -197,15 +201,17 @@
                 </div>
                 {% endfor %}
             {% else %}
-            <div class="no-data">No borough data yet</div>
+            <div class="no-data">No live data yet</div>
             {% endif %}
         </div>
 
-        <!-- Historical Top 5 -->
+        <!-- Batch Layer — historical top 5 -->
         <div class="card">
             <div class="card-header">
-                <span class="card-title">📋 Most Common Complaints Historically</span>
-                <span class="card-badge">2020–2026 · 7.35M records</span>
+                <span class="card-title">
+                    📊 Batch Layer — Top 5 All Time
+                </span>
+                <span class="card-badge">7.35M complaints · 2020–2026</span>
             </div>
             {% if batch_top5 %}
             <table>
@@ -225,22 +231,26 @@
                         </span>
                     </td>
                     <td class="complaint-name">{{ item.complaint_type }}</td>
-                    <td class="count-batch">{{ "{:,}".format(item.total_count) }}</td>
+                    <td class="count-batch">
+                        {{ "{:,}".format(item.total_count) }}
+                    </td>
                 </tr>
                 {% endfor %}
                 </tbody>
             </table>
             {% else %}
-            <div class="no-data">Historical data loading...</div>
+            <div class="no-data">Run EMR to load historical data</div>
             {% endif %}
         </div>
 
     </div>
 
-    <!-- Historical Borough Ranking -->
+    <!-- Batch Layer — historical borough ranking -->
     <div class="card">
         <div class="card-header">
-            <span class="card-title">🗺 Which Boroughs Have the Most Complaints Historically?</span>
+            <span class="card-title">
+                📊 Batch Layer — Borough Complaint History
+            </span>
             <span class="card-badge">2020–2026 · All complaint types</span>
         </div>
         {% if batch_boroughs %}
@@ -263,16 +273,16 @@
             {% endfor %}
             </div>
         {% else %}
-        <div class="no-data">Historical borough data loading...</div>
+        <div class="no-data">Run EMR to load borough history</div>
         {% endif %}
     </div>
 
 </div>
 
 <div class="footer">
-    NYC 311 Real-Time Complaint Surge Detection System |
+    NYC 311 Real-Time Complaint Surge Detection |
     NCI MSc Cloud Computing 2026 — Ananya & Satvik |
-    Data: NYC Open Data (2020–2026) · 7.35M records |
+    Data: NYC Open Data · 7.35M complaints |
     Auto-refreshes every 30 seconds
 </div>
 
