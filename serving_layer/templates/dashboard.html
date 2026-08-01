@@ -6,218 +6,240 @@
     <title>NYC 311 Complaint Surge Detection</title>
     <meta http-equiv="refresh" content="30">
     <link rel="stylesheet" href="/static/css/style.css">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 </head>
 <body>
 
+<!-- Header -->
 <div class="header">
     <div class="header-left">
-        <h1>🗽 NYC 311 Real-Time Complaint Surge Detection</h1>
-        <p>
-            Speed Layer (last 5 min) compared against
-            Batch Layer (historical average for this hour and day)
-        </p>
+        <div class="header-logo">NYC 311</div>
+        <div>
+            <h1>Real-Time Complaint Surge Detection</h1>
+            <p>Speed Layer (last 5 min) vs Batch Layer (avg for same hour &amp; day of week)</p>
+        </div>
     </div>
     <div class="header-right">
-        <span class="live-badge">● LIVE</span>
+        <span class="live-badge">
+            <span class="live-dot"></span> LIVE
+        </span>
         <div class="timestamp">
-            Window: {{ window_id }}<br>
-            Updated: {{ timestamp }}
+            <div>Window: <strong>{{ window_id }}</strong></div>
+            <div>{{ timestamp }}</div>
         </div>
     </div>
 </div>
 
 <div class="container">
 
-    <!-- Key Metrics -->
+    <!-- Metrics Row -->
     <div class="metrics-row">
         <div class="metric-card">
-            <div class="metric-value">{{ total_records }}</div>
-            <div class="metric-label">Complaints This Window</div>
+            <div class="metric-icon">📋</div>
+            <div class="metric-body">
+                <div class="metric-label">Complaints This Window</div>
+                <div class="metric-value">{{ total_records }}</div>
+            </div>
         </div>
-        <div class="metric-card warn">
-            <div class="metric-value">{{ rolling_avg }}</div>
-            <div class="metric-label">Complaints Per Minute</div>
+        <div class="metric-card accent-green">
+            <div class="metric-icon">⚡</div>
+            <div class="metric-body">
+                <div class="metric-label">Complaints Per Minute</div>
+                <div class="metric-value">{{ rolling_avg }}</div>
+            </div>
         </div>
         <div class="metric-card">
-            <div class="metric-value">{{ top_borough }}</div>
-            <div class="metric-label">Most Active Borough</div>
+            <div class="metric-icon">📍</div>
+            <div class="metric-body">
+                <div class="metric-label">Most Active Borough</div>
+                <div class="metric-value small">{{ top_borough }}</div>
+            </div>
         </div>
         <div class="metric-card">
-            <div class="metric-value">{{ borough_dominance }}</div>
-            <div class="metric-label">Borough Share</div>
+            <div class="metric-icon">📊</div>
+            <div class="metric-body">
+                <div class="metric-label">Borough Share</div>
+                <div class="metric-value">{{ borough_dominance }}</div>
+            </div>
         </div>
-        <div class="metric-card {% if surge_count > 0 %}alert{% else %}green{% endif %}">
-            <div class="metric-value">{{ surge_count }}</div>
-            <div class="metric-label">Active Surge Alerts</div>
+        <div class="metric-card {% if surge_count > 0 %}accent-red{% else %}accent-green{% endif %}">
+            <div class="metric-icon">🚨</div>
+            <div class="metric-body">
+                <div class="metric-label">Active Surge Alerts</div>
+                <div class="metric-value">{{ surge_count }}</div>
+            </div>
         </div>
     </div>
 
-    <!-- Surge Alerts — show only if active -->
-    {% if surge_alerts %}
-    <div class="card">
-        <div class="card-header">
-            <span class="card-title">🚨 Active Surge Alerts</span>
-            <span class="card-badge">{{ surge_count }} requiring attention</span>
+    <!-- Filter + Export Bar -->
+    <div class="filter-bar">
+        <div class="filter-left">
+            <span class="filter-title">Filters</span>
+            <div class="filter-group">
+                <label>Show</label>
+                <select id="anomalousFilter">
+                    <option value="false">All Complaints</option>
+                    <option value="true">Anomalous Only</option>
+                </select>
+            </div>
+            <div class="filter-group">
+                <label>Search</label>
+                <input type="text" id="searchInput" placeholder="e.g. Noise, Parking...">
+            </div>
+            <button class="filter-btn" onclick="applyFilters()">Apply</button>
+            <button class="reset-btn" onclick="resetFilters()">Clear</button>
         </div>
-        <div class="two-col">
+        <div class="filter-right">
+            <a href="/api/export/merged" class="export-btn">
+                <span>↓</span> Export Results CSV
+            </a>
+            <a href="/api/export/alerts" class="export-btn">
+                <span>↓</span> Export Alerts CSV
+            </a>
+        </div>
+    </div>
+
+    <!-- Surge Alerts — only when active -->
+    {% if surge_alerts %}
+    <div class="card alert-card">
+        <div class="card-header">
+            <div class="card-title-group">
+                <span class="card-title">🚨 Active Surge Alerts</span>
+                <span class="tag tag-red">{{ surge_count }} active</span>
+            </div>
+        </div>
+        <div class="alerts-grid">
             {% for alert in surge_alerts %}
-            <div class="surge-alert surge-{{ alert.severity | lower }}">
-                <div>
+            <div class="surge-item surge-{{ alert.severity|lower }}">
+                <div class="surge-left">
                     <div class="surge-name">{{ alert.complaint_type }}</div>
-                    <div class="surge-count">
-                        {{ alert.count }} complaints in current window
-                    </div>
+                    <div class="surge-meta">{{ alert.count }} complaints · threshold {{ alert.threshold }}</div>
                 </div>
-                <span class="severity-badge sev-{{ alert.severity | lower }}">
-                    {{ alert.severity }}
-                </span>
+                <span class="sev-pill sev-{{ alert.severity|lower }}">{{ alert.severity }}</span>
             </div>
             {% endfor %}
         </div>
     </div>
     {% endif %}
 
-    <!-- Filters + Export -->
-    <div class="filter-bar">
-        <span class="filter-title">🔍 Filter</span>
-        <div>
-            <label>Borough</label>
-            <select id="boroughFilter">
-                <option value="all">All Boroughs</option>
-                <option value="MANHATTAN">Manhattan</option>
-                <option value="BROOKLYN">Brooklyn</option>
-                <option value="QUEENS">Queens</option>
-                <option value="BRONX">Bronx</option>
-                <option value="STATEN ISLAND">Staten Island</option>
-            </select>
-        </div>
-        <div>
-            <label>Show</label>
-            <select id="anomalousFilter">
-                <option value="false">All Complaints</option>
-                <option value="true">Anomalous Only</option>
-            </select>
-        </div>
-        <div>
-            <label>Search</label>
-            <input type="text" id="searchInput" placeholder="e.g. Noise, Parking...">
-        </div>
-        <div class="filter-actions">
-            <button class="filter-btn" onclick="applyFilters()">Apply</button>
-            <button class="reset-btn" onclick="resetFilters()">Reset</button>
-        </div>
-        <div class="export-actions">
-            <a href="/api/export/merged" class="export-btn">⬇ Export Results CSV</a>
-            <a href="/api/export/alerts" class="export-btn">⬇ Export Alerts CSV</a>
-        </div>
-    </div>
+    <!-- Main: Table + Chart side by side -->
+    <div class="main-grid">
 
-    <!-- Main Merge Table -->
-    <div class="card">
-        <div class="card-header">
-            <span class="card-title">
-                📊 Top 5 Surging Complaints —
-                Speed Layer vs Batch Layer Baseline
-            </span>
-            <span class="card-badge">
-                Last 5 minutes vs historical avg for this hour and day
-            </span>
-        </div>
-        {% if merged %}
-        <table id="mergeTable">
-            <thead>
-                <tr>
-                    <th>Rank</th>
-                    <th>Complaint Type</th>
-                    <th>⚡ Right Now (Speed Layer)</th>
-                    <th>📊 Historical Avg (Batch Layer)</th>
-                    <th>Deviation</th>
-                    <th>Assessment</th>
-                </tr>
-            </thead>
-            <tbody>
-            {% for item in merged %}
-            <tr class="merge-row"
-                data-anomalous="{{ item.is_anomalous|lower }}"
-                data-type="{{ item.complaint_type }}">
-                <td>
-                    <span class="rank-badge rank-{{ item.rank }}">
-                        {{ item.rank }}
-                    </span>
-                </td>
-                <td class="complaint-name">{{ item.complaint_type }}</td>
-                <td class="count-now">{{ item.current_count }} complaints</td>
-                <td class="count-hist">~{{ item.historical_avg }} per window</td>
-                <td class="{% if item.deviation_pct and item.deviation_pct > 100 %}deviation-high{% else %}deviation-low{% endif %}">
-                    {% if item.deviation_pct %}
-                        +{{ item.deviation_pct }}% above normal
-                    {% else %}
-                        No baseline data
-                    {% endif %}
-                </td>
-                <td>
-                    <span class="anomaly-badge
-                        {% if item.is_anomalous %}anomaly-true
-                        {% else %}anomaly-false{% endif %}">
-                        {% if item.is_anomalous %}⚠ Unusual
-                        {% else %}✓ Expected{% endif %}
-                    </span>
-                </td>
-            </tr>
-            {% endfor %}
-            </tbody>
-        </table>
-        {% else %}
-        <div class="no-data">
-            No complaints in current window.<br>
-            Start the producer to see live results.
-        </div>
-        {% endif %}
-    </div>
-
-    <!-- Speed Layer + Batch Layer side by side -->
-    <div class="two-col">
-
-        <!-- Speed Layer — live borough -->
+        <!-- Speed vs Batch Table -->
         <div class="card">
             <div class="card-header">
-                <span class="card-title">
-                    ⚡ Speed Layer — Live Borough Breakdown
-                </span>
-                <span class="card-badge">Last 1 minute</span>
+                <div class="card-title-group">
+                    <span class="card-title">Speed Layer vs Batch Layer</span>
+                    <span class="tag tag-green">Last 5 min vs avg for this hour &amp; day of week</span>
+                </div>
+            </div>
+            {% if merged %}
+            <table id="mergeTable">
+                <thead>
+                    <tr>
+                        <th width="40">#</th>
+                        <th>Complaint Type</th>
+                        <th>Right Now</th>
+                        <th>Historical Avg</th>
+                        <th>Above Normal</th>
+                        <th>Alert Level</th>
+                    </tr>
+                </thead>
+                <tbody>
+                {% for item in merged %}
+                <tr class="merge-row"
+                    data-anomalous="{{ item.is_anomalous|lower }}"
+                    data-type="{{ item.complaint_type|lower }}">
+                    <td>
+                        <span class="rank-badge rank-{{ item.rank }}">{{ item.rank }}</span>
+                    </td>
+                    <td class="complaint-name">{{ item.complaint_type }}</td>
+                    <td class="count-now">{{ item.current_count }}</td>
+                    <td class="count-hist">{{ item.historical_avg }}</td>
+                    <td>
+                        <span class="dev-pill {% if item.deviation_pct and item.deviation_pct > 100 %}dev-high{% else %}dev-low{% endif %}">
+                            {% if item.deviation_pct %}+{{ item.deviation_pct }}%{% else %}N/A{% endif %}
+                        </span>
+                    </td>
+                    <td>
+                        <span class="status-pill {% if item.is_anomalous %}status-unusual{% else %}status-normal{% endif %}">
+                            {% if item.is_anomalous %}⚠ Unusual{% else %}✓ Normal{% endif %}
+                        </span>
+                    </td>
+                </tr>
+                {% endfor %}
+                </tbody>
+            </table>
+            {% else %}
+            <div class="no-data">
+                <div class="no-data-icon">📭</div>
+                No data yet — start the producer to see live results
+            </div>
+            {% endif %}
+        </div>
+
+        <!-- Now vs Historical Chart -->
+        <div class="card">
+            <div class="card-header">
+                <div class="card-title-group">
+                    <span class="card-title">Now vs Historical Average</span>
+                    <span class="tag tag-green">Last 5 min · Top 5 complaints</span>
+                </div>
+            </div>
+            <div class="chart-wrap">
+                <canvas id="comparisonChart"></canvas>
+            </div>
+        </div>
+
+    </div>
+
+    <!-- Borough + Batch Top 5 -->
+    <div class="two-col">
+
+        <!-- Live Borough Breakdown -->
+        <div class="card">
+            <div class="card-header">
+                <div class="card-title-group">
+                    <span class="card-title">Live Borough Breakdown</span>
+                    <span class="tag tag-green">Speed Layer · last 5 min</span>
+                </div>
             </div>
             {% if borough_rates %}
                 {% for b in borough_rates %}
                 <div class="borough-row">
                     <div class="borough-name">{{ b.borough }}</div>
-                    <div class="borough-bar-bg">
-                        <div class="borough-bar"
-                             style="width:{{ [b.projected_rate / max_rate * 100, 100]|min }}%">
+                    <div class="borough-bar-wrap">
+                        <div class="borough-bar-bg">
+                            <div class="borough-bar live-bar"
+                                 style="width:{{ [b.projected_rate / max_rate * 100, 100]|min }}%">
+                            </div>
                         </div>
-                    </div>
-                    <div class="borough-count">
-                        {{ b.count_1min }} complaints
+                        <div class="borough-count">{{ b.count_1min }}</div>
                     </div>
                 </div>
                 {% endfor %}
             {% else %}
-            <div class="no-data">No live data yet</div>
+            <div class="no-data">
+                <div class="no-data-icon">📭</div>
+                No live data yet
+            </div>
             {% endif %}
         </div>
 
-        <!-- Batch Layer — historical top 5 -->
+        <!-- Batch Top 5 All Time -->
         <div class="card">
             <div class="card-header">
-                <span class="card-title">
-                    📊 Batch Layer — Top 5 All Time
-                </span>
-                <span class="card-badge">7.35M complaints · 2020–2026</span>
+                <div class="card-title-group">
+                    <span class="card-title">All-Time Top 5 Complaints</span>
+                    <span class="tag tag-blue">Batch Layer · 7.35M records</span>
+                </div>
             </div>
             {% if batch_top5 %}
             <table>
                 <thead>
                     <tr>
-                        <th>Rank</th>
+                        <th width="40">#</th>
                         <th>Complaint Type</th>
                         <th>Total Reports</th>
                     </tr>
@@ -225,15 +247,9 @@
                 <tbody>
                 {% for item in batch_top5 %}
                 <tr>
-                    <td>
-                        <span class="rank-badge rank-{{ loop.index }}">
-                            {{ loop.index }}
-                        </span>
-                    </td>
+                    <td><span class="rank-badge rank-{{ loop.index }}">{{ loop.index }}</span></td>
                     <td class="complaint-name">{{ item.complaint_type }}</td>
-                    <td class="count-batch">
-                        {{ "{:,}".format(item.total_count) }}
-                    </td>
+                    <td class="count-batch">{{ "{:,}".format(item.total_count) }}</td>
                 </tr>
                 {% endfor %}
                 </tbody>
@@ -245,33 +261,32 @@
 
     </div>
 
-    <!-- Batch Layer — historical borough ranking -->
+    <!-- Historical Borough Ranking -->
     <div class="card">
         <div class="card-header">
-            <span class="card-title">
-                📊 Batch Layer — Borough Complaint History
-            </span>
-            <span class="card-badge">2020–2026 · All complaint types</span>
+            <div class="card-title-group">
+                <span class="card-title">Historical Borough Ranking</span>
+                <span class="tag tag-blue">Batch Layer · 2020–2026</span>
+            </div>
         </div>
         {% if batch_boroughs %}
-            {% set max_c = batch_boroughs[0].total_complaints %}
-            <div class="two-col">
+        <div class="borough-grid">
             {% for b in batch_boroughs %}
             {% if b.borough and b.borough != 'Unspecified' %}
             <div class="borough-row">
                 <div class="borough-name">{{ b.borough }}</div>
-                <div class="borough-bar-bg">
-                    <div class="borough-bar batch-bar"
-                         style="width:{{ [b.total_complaints / max_c * 100, 100]|min }}%">
+                <div class="borough-bar-wrap">
+                    <div class="borough-bar-bg">
+                        <div class="borough-bar batch-bar"
+                             style="width:{{ [b.total_complaints / batch_boroughs[0].total_complaints * 100, 100]|min }}%">
+                        </div>
                     </div>
-                </div>
-                <div class="borough-count">
-                    {{ "{:,}".format(b.total_complaints) }} total
+                    <div class="borough-count">{{ "{:,}".format(b.total_complaints) }}</div>
                 </div>
             </div>
             {% endif %}
             {% endfor %}
-            </div>
+        </div>
         {% else %}
         <div class="no-data">Run EMR to load borough history</div>
         {% endif %}
@@ -280,11 +295,80 @@
 </div>
 
 <div class="footer">
-    NYC 311 Real-Time Complaint Surge Detection |
-    NCI MSc Cloud Computing 2026 — Ananya & Satvik |
-    Data: NYC Open Data · 7.35M complaints |
+    NYC 311 Real-Time Complaint Surge Detection &nbsp;·&nbsp;
+    Data: NYC Open Data &nbsp;·&nbsp;
     Auto-refreshes every 30 seconds
 </div>
+
+<script>
+const mergedData = {{ merged | tojson | safe }};
+
+if (mergedData && mergedData.length > 0) {
+    var labels   = mergedData.map(function(d) {
+        var w = d.complaint_type.split(' ');
+        return w.length > 3 ? w.slice(0,3).join(' ') + '...' : d.complaint_type;
+    });
+    var nowData  = mergedData.map(function(d) { return d.current_count || 0; });
+    var histData = mergedData.map(function(d) { return d.historical_avg || 0; });
+
+    new Chart(document.getElementById('comparisonChart'), {
+        type: 'bar',
+        data: {
+            labels: labels,
+            datasets: [
+                {
+                    label: 'Right Now (5 min)',
+                    data: nowData,
+                    backgroundColor: '#3b82f6',
+                    borderRadius: 6,
+                    borderSkipped: false
+                },
+                {
+                    label: 'Historical Avg',
+                    data: histData,
+                    backgroundColor: '#94a3b8',
+                    borderRadius: 6,
+                    borderSkipped: false
+                }
+            ]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: {
+                legend: {
+                    onClick: function() { return false; },
+                    labels: {
+                        color: '#1e293b',
+                        font: { size: 11, family: 'Inter' },
+                        usePointStyle: true,
+                        pointStyle: 'rect'
+                    }
+                }
+            },
+            scales: {
+                x: {
+                    ticks: {
+                        color: '#64748b',
+                        font: { size: 10, family: 'Inter' },
+                        maxRotation: 30
+                    },
+                    grid: { color: '#f1f5f9' }
+                },
+                y: {
+                    beginAtZero: true,
+                    ticks: {
+                        color: '#64748b',
+                        font: { size: 10, family: 'Inter' },
+                        precision: 0
+                    },
+                    grid: { color: '#f1f5f9' }
+                }
+            }
+        }
+    });
+}
+</script>
 
 <script src="/static/js/main.js"></script>
 </body>

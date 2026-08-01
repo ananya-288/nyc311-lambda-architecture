@@ -20,10 +20,14 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
 dynamodb      = boto3.resource('dynamodb', region_name='us-east-1')
-s3            = boto3.client('s3',         region_name='us-east-1')
+s3            = boto3.client('s3', region_name='us-east-1')
 results_table = dynamodb.Table('nyc311-speed-results')
 
 BUCKET = 'nyc311-lambda-architecture'
+
+# Simple in-memory cache for batch baseline
+_baseline_cache = {'data': None, 'ts': 0, 'hour': -1, 'dow': -1}
+CACHE_TTL = 300  # 5 minutes
 
 
 def decimal_to_float(obj):
@@ -34,11 +38,11 @@ def decimal_to_float(obj):
 
 def get_speed_layer_results():
     try:
-        response = results_table.scan(Limit=10)
+        response = results_table.scan()
         items    = response.get('Items', [])
         if not items:
             return None
-        items.sort(key=lambda x: x.get('timestamp', ''), reverse=True)
+        items.sort(key=lambda x: x.get('window_id', ''), reverse=True)
         latest = items[0]
         return {
             'window_id'        : latest.get('window_id', 'N/A'),
@@ -56,13 +60,25 @@ def get_speed_layer_results():
 
 
 def get_batch_baseline():
-    try:
-        athena       = boto3.client('athena', region_name='us-east-1')
-        now          = datetime.now(timezone.utc)
-        current_hour = now.hour
-        current_dow  = now.isoweekday() % 7 + 1
+    """Query Athena for historical baseline — cached for 5 minutes."""
+    global _baseline_cache
+    now          = datetime.now(timezone.utc)
+    current_hour = now.hour
+    current_dow  = now.isoweekday() % 7 + 1
 
-        query = f"""
+    # Return cache if still valid and same time slot
+    if (
+        _baseline_cache['data'] is not None
+        and time.time() - _baseline_cache['ts'] < CACHE_TTL
+        and _baseline_cache['hour'] == current_hour
+        and _baseline_cache['dow'] == current_dow
+    ):
+        logger.info("Returning cached baseline")
+        return _baseline_cache['data']
+
+    try:
+        athena   = boto3.client('athena', region_name='us-east-1')
+        query    = f"""
             SELECT complaint_type, borough, avg_count_per_5min_window
             FROM nyc311_db.nyc311_baseline
             WHERE hour = {current_hour}
@@ -83,6 +99,7 @@ def get_batch_baseline():
             if status == 'SUCCEEDED':
                 break
             elif status in ('FAILED', 'CANCELLED'):
+                logger.error(f"Athena query {status}")
                 return {}
             time.sleep(1)
 
@@ -97,62 +114,100 @@ def get_batch_baseline():
                 except (ValueError, IndexError):
                     continue
 
+        # Update cache
+        _baseline_cache = {
+            'data': baseline,
+            'ts'  : time.time(),
+            'hour': current_hour,
+            'dow' : current_dow
+        }
+
         logger.info(f"Athena returned {len(baseline)} baseline entries")
         return baseline
+
     except Exception as e:
         logger.error(f"Athena error: {e}")
         return {}
 
 
 def get_batch_top5():
+    """Read top 5 complaint types all time from Spark SQL results."""
     try:
-        response = s3.list_objects_v2(Bucket=BUCKET, Prefix='batch-results/top5-overall/')
+        response = s3.list_objects_v2(
+            Bucket=BUCKET,
+            Prefix='batch-results/top5-overall/'
+        )
         if 'Contents' not in response:
             return []
+
+        result = []
         for obj in response['Contents']:
-            if obj['Key'].endswith('.csv') and 'part-' in obj['Key']:
-                content = s3.get_object(Bucket=BUCKET, Key=obj['Key'])['Body'].read().decode('utf-8')
-                lines   = content.strip().split('\n')
-                result  = []
-                for line in lines[1:]:
-                    parts = line.split(',')
-                    if len(parts) >= 2:
-                        try:
-                            result.append({
-                                'complaint_type': parts[0].strip(),
-                                'total_count'   : int(parts[1].strip())
-                            })
-                        except (ValueError, IndexError):
-                            continue
-                return result[:5]
-        return []
+            if not obj['Key'].endswith('.csv'):
+                continue
+            if 'part-' not in obj['Key']:
+                continue
+            content = s3.get_object(
+                Bucket=BUCKET, Key=obj['Key']
+            )['Body'].read().decode('utf-8')
+            lines = content.strip().split('\n')
+            for line in lines[1:]:
+                parts = line.split(',')
+                if len(parts) >= 2:
+                    try:
+                        result.append({
+                            'complaint_type': parts[0].strip(),
+                            'total_count'   : int(parts[1].strip())
+                        })
+                    except (ValueError, IndexError):
+                        continue
+
+        # Sort and return top 5
+        result.sort(key=lambda x: x['total_count'], reverse=True)
+        return result[:5]
+
     except Exception as e:
         logger.error(f"Error reading batch top5: {e}")
         return []
 
 
 def get_batch_borough_summary():
+    """Read borough summary from Spark SQL results."""
     try:
-        response = s3.list_objects_v2(Bucket=BUCKET, Prefix='batch-results/borough-summary/')
+        response = s3.list_objects_v2(
+            Bucket=BUCKET,
+            Prefix='batch-results/borough-summary/'
+        )
         if 'Contents' not in response:
             return []
+
+        result = []
         for obj in response['Contents']:
-            if obj['Key'].endswith('.csv') and 'part-' in obj['Key']:
-                content = s3.get_object(Bucket=BUCKET, Key=obj['Key'])['Body'].read().decode('utf-8')
-                lines   = content.strip().split('\n')
-                result  = []
-                for line in lines[1:]:
-                    parts = line.split(',')
-                    if len(parts) >= 2:
-                        try:
+            if not obj['Key'].endswith('.csv'):
+                continue
+            if 'part-' not in obj['Key']:
+                continue
+            content = s3.get_object(
+                Bucket=BUCKET, Key=obj['Key']
+            )['Body'].read().decode('utf-8')
+            lines = content.strip().split('\n')
+            for line in lines[1:]:
+                parts = line.split(',')
+                if len(parts) >= 2:
+                    try:
+                        borough = parts[0].strip()
+                        count   = int(parts[1].strip())
+                        # Skip invalid borough names
+                        if borough and borough != 'Unspecified' and not borough[0].isdigit():
                             result.append({
-                                'borough'         : parts[0].strip(),
-                                'total_complaints': int(parts[1].strip()),
+                                'borough'         : borough,
+                                'total_complaints': count
                             })
-                        except (ValueError, IndexError):
-                            continue
-                return result
-        return []
+                    except (ValueError, IndexError):
+                        continue
+
+        result.sort(key=lambda x: x['total_complaints'], reverse=True)
+        return result
+
     except Exception as e:
         logger.error(f"Error reading borough summary: {e}")
         return []
@@ -172,12 +227,16 @@ def merge_speed_and_batch(speed_results, batch_baseline):
         complaint_type = complaint['complaint_type']
         current_count  = complaint['count']
 
+        # Try exact match first
         key            = (complaint_type, top_borough, current_hour, current_dow)
         historical_avg = batch_baseline.get(key, 0)
 
+        # Fallback — any borough match for this complaint + hour + day
         if historical_avg == 0:
             for k, v in batch_baseline.items():
-                if k[0] == complaint_type and k[2] == current_hour and k[3] == current_dow:
+                if (k[0] == complaint_type
+                        and k[2] == current_hour
+                        and k[3] == current_dow):
                     historical_avg = v
                     break
 
@@ -185,7 +244,7 @@ def merge_speed_and_batch(speed_results, batch_baseline):
             deviation_pct = round(
                 (current_count - historical_avg) / historical_avg * 100, 1
             )
-            is_anomalous = abs(deviation_pct) > 50
+            is_anomalous = deviation_pct > 500
         else:
             deviation_pct = None
             is_anomalous  = False
@@ -197,8 +256,7 @@ def merge_speed_and_batch(speed_results, batch_baseline):
             'historical_avg': round(historical_avg, 2),
             'deviation_pct' : deviation_pct,
             'is_anomalous'  : is_anomalous,
-            'window'        : complaint.get('window', 'last_5_minutes'),
-            'status'        : 'ANOMALY' if is_anomalous else 'Normal'
+            'status'        : 'Unusual' if is_anomalous else 'Normal'
         })
 
     return merged
@@ -235,17 +293,11 @@ def api_merged():
     speed_results  = get_speed_layer_results()
     batch_baseline = get_batch_baseline()
     merged         = merge_speed_and_batch(speed_results, batch_baseline)
-
     anomalous_only = request.args.get('anomalous', 'false') == 'true'
-    severity       = request.args.get('severity', 'all')
-
-    surge_alerts = speed_results.get('surge_alerts', []) if speed_results else []
-
-    if severity != 'all':
-        surge_alerts = [a for a in surge_alerts
-                        if a.get('severity', '').upper() == severity.upper()]
     if anomalous_only:
         merged = [m for m in merged if m['is_anomalous']]
+
+    surge_alerts = speed_results.get('surge_alerts', []) if speed_results else []
 
     return jsonify({
         'window_id'        : speed_results.get('window_id') if speed_results else 'N/A',
@@ -261,71 +313,80 @@ def api_merged():
 
 @app.route('/api/export/merged')
 def export_merged():
-    speed_results  = get_speed_layer_results()
-    batch_baseline = get_batch_baseline()
-    merged         = merge_speed_and_batch(speed_results, batch_baseline)
-    anomalous_only = request.args.get('anomalous', 'false') == 'true'
-    if anomalous_only:
-        merged = [m for m in merged if m['is_anomalous']]
+    """Export merged results as CSV."""
+    try:
+        speed_results  = get_speed_layer_results()
+        batch_baseline = get_batch_baseline()
+        merged         = merge_speed_and_batch(speed_results, batch_baseline)
+        anomalous_only = request.args.get('anomalous', 'false') == 'true'
+        if anomalous_only:
+            merged = [m for m in merged if m['is_anomalous']]
 
-    output = io.StringIO()
-    writer = csv.DictWriter(output, fieldnames=[
-        'rank', 'complaint_type', 'current_count',
-        'historical_avg', 'deviation_pct', 'is_anomalous', 'status'
-    ])
-    writer.writeheader()
-    writer.writerows(merged)
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow([
+            'rank', 'complaint_type', 'current_count',
+            'historical_avg', 'deviation_pct', 'is_anomalous', 'status'
+        ])
+        for row in merged:
+            writer.writerow([
+                row.get('rank', ''),
+                row.get('complaint_type', ''),
+                row.get('current_count', ''),
+                row.get('historical_avg', ''),
+                row.get('deviation_pct', ''),
+                row.get('is_anomalous', ''),
+                row.get('status', '')
+            ])
 
-    ts = datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')
-    return Response(
-        output.getvalue(),
-        mimetype='text/csv',
-        headers={'Content-Disposition': f'attachment; filename=nyc311_merged_{ts}.csv'}
-    )
+        ts = datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')
+        return Response(
+            output.getvalue(),
+            mimetype='text/csv',
+            headers={
+                'Content-Disposition':
+                    f'attachment; filename=nyc311_merged_{ts}.csv'
+            }
+        )
+    except Exception as e:
+        logger.error(f"Export merged error: {e}")
+        return jsonify({'error': str(e)}), 500
 
 
 @app.route('/api/export/alerts')
 def export_alerts():
-    speed_results = get_speed_layer_results()
-    surge_alerts  = speed_results.get('surge_alerts', []) if speed_results else []
-    severity      = request.args.get('severity', 'all')
-    if severity != 'all':
-        surge_alerts = [a for a in surge_alerts
-                        if a.get('severity', '').upper() == severity.upper()]
+    """Export surge alerts as CSV."""
+    try:
+        speed_results = get_speed_layer_results()
+        surge_alerts  = []
+        if speed_results:
+            surge_alerts = speed_results.get('surge_alerts', [])
 
-    output = io.StringIO()
-    writer = csv.DictWriter(output, fieldnames=[
-        'complaint_type', 'count', 'severity', 'threshold'
-    ])
-    writer.writeheader()
-    writer.writerows(surge_alerts)
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow([
+            'complaint_type', 'count', 'severity', 'threshold'
+        ])
+        for alert in surge_alerts:
+            writer.writerow([
+                alert.get('complaint_type', ''),
+                alert.get('count', ''),
+                alert.get('severity', ''),
+                alert.get('threshold', '')
+            ])
 
-    ts = datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')
-    return Response(
-        output.getvalue(),
-        mimetype='text/csv',
-        headers={'Content-Disposition': f'attachment; filename=nyc311_alerts_{ts}.csv'}
-    )
-
-
-@app.route('/api/export/baseline')
-def export_baseline():
-    batch_baseline = get_batch_baseline()
-    output         = io.StringIO()
-    writer         = csv.writer(output)
-    writer.writerow([
-        'complaint_type', 'borough', 'hour',
-        'day_of_week', 'avg_count_per_5min_window'
-    ])
-    for (ct, borough, hour, dow), avg in batch_baseline.items():
-        writer.writerow([ct, borough, hour, dow, avg])
-
-    ts = datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')
-    return Response(
-        output.getvalue(),
-        mimetype='text/csv',
-        headers={'Content-Disposition': f'attachment; filename=nyc311_baseline_{ts}.csv'}
-    )
+        ts = datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')
+        return Response(
+            output.getvalue(),
+            mimetype='text/csv',
+            headers={
+                'Content-Disposition':
+                    f'attachment; filename=nyc311_alerts_{ts}.csv'
+            }
+        )
+    except Exception as e:
+        logger.error(f"Export alerts error: {e}")
+        return jsonify({'error': str(e)}), 500
 
 
 @app.route('/')
@@ -358,7 +419,9 @@ def dashboard():
             rolling_avg   = rolling.get('rolling_avg_per_min', 'N/A')
             borough_rates = rolling.get('borough_rates', [])
             if borough_rates:
-                max_rate = max(b.get('projected_rate', 1) for b in borough_rates) or 1
+                max_rate = max(
+                    b.get('projected_rate', 1) for b in borough_rates
+                ) or 1
 
     return render_template(
         'dashboard.html',
